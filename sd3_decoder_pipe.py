@@ -69,32 +69,36 @@ def expand_dims_like(x, y):
     return x
 
 
-def transformer_expand_x_embedder(transformer, add_in_channels):
-    # expand input channels for transformer to accommodate dualvitok features
-    orig_x_embedder = transformer.x_embedder
-    new_in_channels = orig_x_embedder.in_features + add_in_channels
+def transformer_expand_input_channels(transformer, add_in_channels):
+    """
+    Expand transformer input channels to accommodate additional VQ-GAN features.
+    Similar to unet_expand_conv_in but for SD3 transformer.
+    """
+    # For SD3 transformer, we need to modify the input projection layer
+    # This is typically the first linear layer that processes the input latents
+    orig_proj = transformer.pos_embed.proj
+    new_in_channels = orig_proj.in_channels + add_in_channels
 
-    # Create new linear layer with expanded input channels
-    new_x_embedder = nn.Linear(
-        new_in_channels,
-        orig_x_embedder.out_features,
-        bias=(orig_x_embedder.bias is not None)
+    new_proj = torch.nn.Conv2d(
+        in_channels=new_in_channels,
+        out_channels=orig_proj.out_channels,
+        kernel_size=orig_proj.kernel_size,
+        stride=orig_proj.stride,
+        padding=orig_proj.padding,
+        bias=(orig_proj.bias is not None)
     )
 
-    # Initialize the new layer
+    # Copy original weights
     with torch.no_grad():
-        # Zero-initialize all weights
-        new_x_embedder.weight.zero_()
+        new_proj.weight.zero_()
+        new_proj.weight[:, :orig_proj.in_channels] = orig_proj.weight
+        # Initialize new channels with small random values
+        # torch.nn.init.kaiming_normal_(new_proj.weight[:, orig_proj.in_channels:], mode='fan_out')
+        if new_proj.bias is not None and orig_proj.bias is not None:
+            new_proj.bias.copy_(orig_proj.bias)
 
-        # Copy original weights
-        new_x_embedder.weight[:, :orig_x_embedder.in_features] = orig_x_embedder.weight.clone()
+    transformer.pos_embed.proj = new_proj
 
-        # Copy bias if present
-        if orig_x_embedder.bias is not None:
-            new_x_embedder.bias.copy_(orig_x_embedder.bias)
-
-    # Replace the original embedder
-    transformer.x_embedder = new_x_embedder
     return transformer
 
 
@@ -893,7 +897,7 @@ class StableDiffusion3DecoderPipeline(DiffusionPipeline, SD3LoraLoaderMixin, Fro
     @torch.no_grad()
     def __call__(
             self,
-            image,
+            images,
             vq_indices: Optional[torch.LongTensor] = None,
             vq_embeds: Optional[torch.LongTensor] = None,
             prompt: Union[str, List[str]] = None,
@@ -950,19 +954,19 @@ class StableDiffusion3DecoderPipeline(DiffusionPipeline, SD3LoraLoaderMixin, Fro
         self._interrupt = False
 
         # 2. Define call parameters
-        if image is not None and isinstance(image, str):
+        if images is not None and isinstance(images, str):
             batch_size = 1
-            image = [Image.open(image)]
-        elif image is not None and isinstance(image, PIL.Image.Image):
+            images = [Image.open(images)]
+        elif images is not None and isinstance(images, PIL.Image.Image):
             batch_size = 1
-            image = [image]
-        elif image is not None and isinstance(image, list):
-            batch_size = len(image)
-            if not is_pil_image(image[0]):
+            images = [images]
+        elif images is not None and isinstance(images, (list, tuple)):
+            batch_size = len(images)
+            if not is_pil_image(images[0]):
                 from PIL import Image
-                image = [Image.open(item) for item in image]
-        elif image is not None and is_pil_image(image):
-            batch_size = 1
+                images = [Image.open(item) for item in images]
+        elif images is not None and isinstance(images, torch.Tensor):
+            batch_size = images.shape[0]
         elif prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -1004,8 +1008,8 @@ class StableDiffusion3DecoderPipeline(DiffusionPipeline, SD3LoraLoaderMixin, Fro
                 indices_semantic, indices_detail = vq_indices[0], vq_indices[1]
                 vq_embeds = self.vq_model_embedder.indices_to_codes(
                     indices_semantic, indices_detail)
-        elif image is not None:
-            vq_embeds, indices_semantic, indices_detail = self.vq_model_embedder(image, return_indices=True)
+        elif images is not None:
+            vq_embeds, indices_semantic, indices_detail = self.vq_model_embedder(images, return_indices=True)
 
         if self.do_classifier_free_guidance:
             negative_vq_embeds = torch.zeros_like(vq_embeds)
@@ -1023,8 +1027,8 @@ class StableDiffusion3DecoderPipeline(DiffusionPipeline, SD3LoraLoaderMixin, Fro
             pooled_prompt_embeds = prompt_embeds.mean(1)
             print('using vq_embedder projector')
         else:
-            prompt_embeds = self.empty_prompt_embeds.repeat(vq_embeds.shape[0], 1, 1)
-            pooled_prompt_embeds = self.empty_pooled_prompt_embeds.repeat(vq_embeds.shape[0], 1)
+            prompt_embeds = self.empty_prompt_embeds.repeat(vq_embeds.shape[0], 1, 1).to(vq_embeds.device)
+            pooled_prompt_embeds = self.empty_pooled_prompt_embeds.repeat(vq_embeds.shape[0], 1).to(vq_embeds.device)
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels - self.dualvitok_channels
@@ -1138,18 +1142,17 @@ class StableDiffusion3DecoderPipeline(DiffusionPipeline, SD3LoraLoaderMixin, Fro
                     xm.mark_step()
 
         if output_type == "latent":
-            image = latents
-
+            images = latents
         else:
             latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
-            image = self.vae.decode(latents, return_dict=False)[0]
-            image = self.image_processor.postprocess(image, output_type=output_type)
+            images = self.vae.decode(latents, return_dict=False)[0]
+            images = self.image_processor.postprocess(images, output_type=output_type)
 
         # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image,)
+            return (images,)
 
-        return StableDiffusion3PipelineOutput(images=image)
+        return StableDiffusion3PipelineOutput(images=images)
